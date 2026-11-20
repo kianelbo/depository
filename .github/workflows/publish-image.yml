@@ -40,6 +40,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
 
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Build and publish
         uses: docker/build-push-action@v7
         with:
