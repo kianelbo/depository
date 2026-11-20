@@ -31,13 +31,27 @@ export interface ObjectManifest {
   createdAt: string;
   updatedAt: string;
   metadata: Record<string, string>;
+  /** Short aliases are stored alongside the object, not in separate releases. */
+  shortLinks?: ShortLinkEntry[];
 }
 
+export interface ShortLinkEntry {
+  code: string;
+  createdAt: string;
+}
+
+export interface ShortLink {
+  code: string;
+  objectKey: string;
+  createdAt: string;
+}
+
+/** Legacy manifest type retained to read and delete links created by older versions. */
 export interface LinkManifest {
   schema: 1;
   kind: "link";
   code: string;
-  targetUrl: string;
+  objectKey: string;
   createdAt: string;
 }
 

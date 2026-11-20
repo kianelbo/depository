@@ -135,14 +135,28 @@ test("objects are created, replaced, listed and deleted through release records"
   );
 });
 
-test("short links are backed by releases and duplicate custom codes conflict", async () => {
+test("short links are stored in their object release and survive object replacement", async () => {
   const fake = new FakeGitHub();
   const store = new DepositoryStore(fake as unknown as import("../src/github.js").GitHubClient, 1024);
-  const created = await store.createLink({ code: "docs", targetUrl: "https://example.com/docs" });
+  await assert.rejects(() => store.createLink({ code: "docs", objectKey: "docs/missing.txt" }));
+  await store.putObject("docs/readme.txt", Buffer.from("hello"), { contentType: "text/plain", metadata: {} });
+  const created = await store.createLink({ code: "docs", objectKey: "docs/readme.txt" });
   assert.equal(created.code, "docs");
-  assert.equal((await store.getLink("docs")).targetUrl, "https://example.com/docs");
+  assert.equal((await store.getLink("docs")).objectKey, "docs/readme.txt");
+  assert.equal((await fake.listReleases(1)).length, 1, "creating a link must not create another release");
+  const storedManifest = JSON.parse((await fake.listReleases(1))[0]!.body!) as { shortLinks: { code: string }[] };
+  assert.deepEqual(storedManifest.shortLinks.map((entry) => entry.code), ["docs"]);
+
   await assert.rejects(
-    () => store.createLink({ code: "docs", targetUrl: "https://example.org" }),
+    () => store.createLink({ code: "docs", objectKey: "docs/readme.txt" }),
     (error: unknown) => error instanceof AppError && error.statusCode === 409,
   );
+
+  await store.putObject("docs/readme.txt", Buffer.from("replaced"), { contentType: "text/plain", metadata: {} });
+  const linked = await store.getLinkedObject("docs");
+  assert.equal(linked.asset.size, 8);
+
+  await store.deleteLink("docs");
+  await assert.rejects(() => store.getLinkedObject("docs"), AppError);
+  assert.equal((await fake.listReleases(1)).length, 1, "deleting a link must not delete the object release");
 });

@@ -121,17 +121,25 @@ export function buildServer(config: Config) {
   });
 
   app.post("/links", async (request, reply) => {
-    const body = parseJsonBody<{ targetUrl?: unknown; code?: unknown }>(request.body);
-    if (typeof body.targetUrl !== "string") throw new AppError("targetUrl is required", 400, "invalid_body");
+    const body = parseJsonBody<{ objectKey?: unknown; code?: unknown }>(request.body);
+    if (typeof body.objectKey !== "string") throw new AppError("objectKey is required", 400, "invalid_body");
     if (body.code !== undefined && typeof body.code !== "string") throw new AppError("code must be a string", 400, "invalid_body");
-    const link = await store.createLink({ targetUrl: body.targetUrl, ...(typeof body.code === "string" ? { code: body.code } : {}) });
+    const link = await store.createLink({ objectKey: body.objectKey, ...(typeof body.code === "string" ? { code: body.code } : {}) });
     const shortUrl = `${config.publicBaseUrl}/s/${link.code}`;
     return reply.code(201).send({ ...link, shortUrl });
   });
 
   app.get<{ Params: { code: string } }>("/s/:code", async (request, reply) => {
-    const link = await store.getLink(request.params.code);
-    return reply.redirect(link.targetUrl, 302);
+    const { manifest, asset } = await store.getLinkedObject(request.params.code);
+    const upstream = await github.downloadAsset(asset);
+    reply
+      .header("Content-Type", manifest.contentType)
+      .header("Content-Length", String(manifest.size))
+      .header("ETag", `"${manifest.sha256}"`)
+      .header("Last-Modified", new Date(manifest.updatedAt).toUTCString());
+    if (manifest.cacheControl) reply.header("Cache-Control", manifest.cacheControl);
+    for (const [key, value] of Object.entries(manifest.metadata)) reply.header(`x-depository-meta-${key}`, value);
+    return reply.send(Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream));
   });
 
   app.delete<{ Params: { code: string } }>("/links/:code", async (request, reply) => {

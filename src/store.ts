@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { AppError, GitHubApiError, isNotFound } from "./errors.js";
+import { AppError, isNotFound } from "./errors.js";
 import { GitHubClient } from "./github.js";
-import type { GitHubAsset, GitHubRelease, LinkManifest, ObjectManifest, ObjectSummary } from "./types.js";
+import type { GitHubAsset, GitHubRelease, LinkManifest, ObjectManifest, ObjectSummary, ShortLink, ShortLinkEntry } from "./types.js";
 
 const OBJECT_TAG_PREFIX = "depository-object-";
 const LINK_TAG_PREFIX = "depository-link-";
@@ -31,6 +31,18 @@ function parseObjectManifest(release: GitHubRelease): ObjectManifest {
     ) {
       throw new Error("Invalid object manifest");
     }
+    if (value.shortLinks !== undefined) {
+      if (!Array.isArray(value.shortLinks)) throw new Error("Invalid shortLinks");
+      const seen = new Set<string>();
+      for (const entry of value.shortLinks) {
+        if (!entry || typeof entry !== "object" ||
+          typeof entry.code !== "string" || !/^[A-Za-z0-9_-]{3,64}$/.test(entry.code) ||
+          typeof entry.createdAt !== "string" || seen.has(entry.code)) {
+          throw new Error("Invalid short link entry");
+        }
+        seen.add(entry.code);
+      }
+    }
     return value as ObjectManifest;
   } catch {
     throw new AppError("The GitHub release contains an invalid depository object manifest", 502, "corrupt_manifest");
@@ -42,12 +54,10 @@ function parseLinkManifest(release: GitHubRelease): LinkManifest {
     const value = JSON.parse(release.body ?? "") as Partial<LinkManifest>;
     if (
       value.schema !== 1 || value.kind !== "link" || typeof value.code !== "string" ||
-      typeof value.targetUrl !== "string" || typeof value.createdAt !== "string"
+      typeof value.objectKey !== "string" || typeof value.createdAt !== "string"
     ) {
       throw new Error("Invalid link manifest");
     }
-    const parsedUrl = new URL(value.targetUrl);
-    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") throw new Error("Invalid link protocol");
     if (!/^[A-Za-z0-9_-]{3,64}$/.test(value.code)) throw new Error("Invalid short code");
     return value as LinkManifest;
   } catch {
@@ -162,6 +172,7 @@ export class DepositoryStore {
         if (!isNotFound(error)) throw error;
       }
 
+      const previousManifest = previous ? parseObjectManifest(previous) : undefined;
       const now = new Date().toISOString();
       const nextAssetName = assetName();
       const manifest: ObjectManifest = {
@@ -173,9 +184,10 @@ export class DepositoryStore {
         ...(cacheControl === undefined ? {} : { cacheControl }),
         size: content.byteLength,
         sha256: digest,
-        createdAt: previous ? parseObjectManifest(previous).createdAt : now,
+        createdAt: previousManifest?.createdAt ?? now,
         updatedAt: now,
         metadata: options.metadata,
+        ...(previousManifest?.shortLinks?.length ? { shortLinks: previousManifest.shortLinks } : {}),
       };
 
       let release = previous;
@@ -215,7 +227,7 @@ export class DepositoryStore {
       }
 
       if (previous) {
-        const oldAsset = previous.assets.find((asset) => asset.name === parseObjectManifest(previous).assetName);
+        const oldAsset = previous.assets.find((asset) => asset.name === previousManifest?.assetName);
         if (oldAsset) await this.github.deleteAsset(oldAsset.id).catch(() => undefined);
       }
 
@@ -289,8 +301,8 @@ export class DepositoryStore {
     return { objects };
   }
 
-  async createLink(input: { targetUrl: string; code?: string }): Promise<LinkManifest> {
-    const target = validateTargetUrl(input.targetUrl);
+  async createLink(input: { objectKey: string; code?: string }): Promise<ShortLink> {
+    validateKey(input.objectKey, this.maxKeyBytes);
     const requestedCode = input.code;
     if (requestedCode !== undefined && !/^[A-Za-z0-9_-]{3,64}$/.test(requestedCode)) {
       throw new AppError("Short code must be 3-64 characters: letters, numbers, '_' or '-'", 400, "invalid_code");
@@ -299,23 +311,33 @@ export class DepositoryStore {
     const attempts = requestedCode ? 1 : 5;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const code = requestedCode ?? randomBytes(6).toString("base64url");
-      const tag = linkTag(code);
-      const now = new Date().toISOString();
-      const manifest: LinkManifest = { schema: 1, kind: "link", code, targetUrl: target, createdAt: now };
-
       try {
-        await this.github.createRelease({
-          tag_name: tag,
-          name: `depository link ${code}`,
-          body: JSON.stringify(manifest),
-          draft: false,
-          prerelease: true,
-        });
-        return manifest;
+        return await this.mutex.run(`short-link:${code}`, async () => this.mutex.run(objectTag(input.objectKey), async () => {
+          const release = await this.getObjectRelease(input.objectKey);
+          const manifest = parseObjectManifest(release);
+          if (manifest.key !== input.objectKey) {
+            throw new AppError("Object manifest key does not match its release tag", 502, "corrupt_manifest");
+          }
+          if (!release.assets.some((asset) => asset.name === manifest.assetName)) {
+            throw new AppError("Object asset is missing from its GitHub release", 502, "missing_asset");
+          }
+
+          const existing = await this.findShortLink(code);
+          if (existing || await this.getLegacyLink(code)) {
+            throw new AppError("That short code is already in use", 409, "code_conflict");
+          }
+
+          const entry: ShortLinkEntry = { code, createdAt: new Date().toISOString() };
+          const nextManifest: ObjectManifest = {
+            ...manifest,
+            shortLinks: [...(manifest.shortLinks ?? []), entry],
+          };
+          await this.github.updateRelease(release.id, { body: JSON.stringify(nextManifest) });
+          return { code, objectKey: input.objectKey, createdAt: entry.createdAt };
+        }));
       } catch (error) {
-        // 422 means the deterministic tag already exists (or another validation failed).
-        if (error instanceof GitHubApiError && error.status === 422) {
-          if (requestedCode) throw new AppError("That short code is already in use", 409, "code_conflict");
+        if (error instanceof AppError && error.code === "code_conflict") {
+          if (requestedCode) throw error;
           continue;
         }
         throw error;
@@ -325,47 +347,116 @@ export class DepositoryStore {
     throw new AppError("Could not allocate a unique short code", 503, "code_allocation_failed");
   }
 
-  async getLink(code: string): Promise<LinkManifest> {
+  async getLink(code: string): Promise<ShortLink> {
     if (!/^[A-Za-z0-9_-]{3,64}$/.test(code)) {
       throw new AppError("Invalid short code", 404, "not_found");
     }
-    const release = await this.github.getReleaseByTag(linkTag(code));
-    const manifest = parseLinkManifest(release);
-    if (manifest.code !== code) throw new AppError("Short-link manifest code does not match its release tag", 502, "corrupt_manifest");
-    return manifest;
+    const match = await this.findShortLink(code);
+    if (match) {
+      return {
+        code,
+        objectKey: match.manifest.key,
+        createdAt: match.entry.createdAt,
+      };
+    }
+    const legacy = await this.getLegacyLink(code);
+    if (!legacy) throw new AppError("Short link does not exist", 404, "not_found");
+    return { code, objectKey: legacy.objectKey, createdAt: legacy.createdAt };
+  }
+
+  async getLinkedObject(code: string): Promise<{ manifest: ObjectManifest; asset: GitHubAsset }> {
+    if (!/^[A-Za-z0-9_-]{3,64}$/.test(code)) {
+      throw new AppError("Invalid short code", 404, "not_found");
+    }
+    const match = await this.findShortLink(code);
+    if (match) {
+      const asset = match.release.assets.find((candidate) => candidate.name === match.manifest.assetName);
+      if (!asset) throw new AppError("Object asset is missing from its GitHub release", 502, "missing_asset");
+      return { manifest: match.manifest, asset };
+    }
+
+    // Continue serving links created by older versions, which used a dedicated release per link.
+    const legacy = await this.getLegacyLink(code);
+    if (!legacy) throw new AppError("Short link does not exist", 404, "not_found");
+    return this.getObject(legacy.objectKey);
   }
 
   async deleteLink(code: string): Promise<void> {
     if (!/^[A-Za-z0-9_-]{3,64}$/.test(code)) {
       throw new AppError("Invalid short code", 400, "invalid_code");
     }
-    const tag = linkTag(code);
-    const release = await this.github.getReleaseByTag(tag);
+
+    const match = await this.findShortLink(code);
+    if (match) {
+      await this.mutex.run(`short-link:${code}`, async () => this.mutex.run(objectTag(match.manifest.key), async () => {
+        const release = await this.getObjectRelease(match.manifest.key);
+        const manifest = parseObjectManifest(release);
+        if (manifest.key !== match.manifest.key) {
+          throw new AppError("Object manifest key does not match its release tag", 502, "corrupt_manifest");
+        }
+        const nextLinks = (manifest.shortLinks ?? []).filter((entry) => entry.code !== code);
+        if (nextLinks.length === (manifest.shortLinks ?? []).length) {
+          throw new AppError("Short link does not exist", 404, "not_found");
+        }
+        const nextManifest: ObjectManifest = { ...manifest, shortLinks: nextLinks };
+        await this.github.updateRelease(release.id, { body: JSON.stringify(nextManifest) });
+      }));
+      return;
+    }
+
+    // Remove a legacy dedicated-link release when an old short code is deleted.
+    const legacyRelease = await this.getLegacyLinkRelease(code);
+    if (!legacyRelease) throw new AppError("Short link does not exist", 404, "not_found");
+    await this.github.deleteRelease(legacyRelease.id);
+    await this.github.deleteTag(linkTag(code)).catch(() => undefined);
+  }
+
+  private async findShortLink(code: string): Promise<{
+    release: GitHubRelease;
+    manifest: ObjectManifest;
+    entry: ShortLinkEntry;
+  } | undefined> {
+    for (let page = 1; ; page += 1) {
+      const releases = await this.github.listReleases(page);
+      for (const release of releases) {
+        if (!release.tag_name.startsWith(OBJECT_TAG_PREFIX)) continue;
+        try {
+          const manifest = parseObjectManifest(release);
+          if (manifest.key !== undefined && objectTag(manifest.key) === release.tag_name) {
+            const entry = manifest.shortLinks?.find((candidate) => candidate.code === code);
+            if (entry) return { release, manifest, entry };
+          }
+        } catch (error) {
+          // Ignore unrelated or corrupt object releases while scanning for an alias.
+          if (!(error instanceof AppError)) throw error;
+        }
+      }
+      if (releases.length < 100) return undefined;
+    }
+  }
+
+  private async getLegacyLink(code: string): Promise<LinkManifest | undefined> {
+    const release = await this.getLegacyLinkRelease(code);
+    if (!release) return undefined;
     const manifest = parseLinkManifest(release);
-    if (manifest.code !== code) throw new AppError("Short-link manifest code does not match its release tag", 502, "corrupt_manifest");
-    await this.github.deleteRelease(release.id);
-    await this.github.deleteTag(tag).catch(() => undefined);
+    if (manifest.code !== code) {
+      throw new AppError("Short-link manifest code does not match its release tag", 502, "corrupt_manifest");
+    }
+    return manifest;
+  }
+
+  private async getLegacyLinkRelease(code: string): Promise<GitHubRelease | undefined> {
+    try {
+      return await this.github.getReleaseByTag(linkTag(code));
+    } catch (error) {
+      if (isNotFound(error)) return undefined;
+      throw error;
+    }
   }
 
   private async getObjectRelease(key: string): Promise<GitHubRelease> {
     return this.github.getReleaseByTag(objectTag(key));
   }
-}
-
-function validateTargetUrl(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new AppError("targetUrl must be a valid absolute URL", 400, "invalid_target_url");
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new AppError("Only http and https short-link targets are allowed", 400, "invalid_target_url");
-  }
-  if (url.username || url.password || Buffer.byteLength(value, "utf8") > 8_192) {
-    throw new AppError("Short-link targets cannot contain credentials and must be at most 8 KiB", 400, "invalid_target_url");
-  }
-  return url.toString();
 }
 
 export function collectObjectMetadata(headers: Record<string, unknown>): Record<string, string> {
