@@ -22,15 +22,22 @@ Object and link-management endpoints require the configured API bearer token. Sh
 
 GitHub allows at most 1,000 assets per release. One release per object avoids that per-release ceiling and gives direct object lookup by deterministic tag. A short link is stored in that object's release manifest, so creating or deleting an alias does not create or delete a release. The trade-off is that resolving a short code must scan paginated object releases because there is no reverse index or database; alias lookup therefore becomes slower as the repository grows. Listing objects has the same scanning cost. This is currently suitable only for a personal or low-volume store, not a high-QPS, high-cardinality production object-storage service.
 
-## Requirements
+## How to run
+
+```bash
+docker pull ghcr.io/kianelbo/depository:latest
+docker run -d --name depository --env-file .env -p 3000:3000 ghcr.io/kianelbo/depository:latest
+```
+
+## Run locally
+
+### Requirements
 
 - Node.js 20.11 or newer
-- A GitHub repository used for Depository data (note that the repository must contain at least one file to enable releases)
+- A dedicated GitHub repository used for Depository data (note that the repository must contain at least one file to enable releases)
 - A GitHub fine-grained personal access token with **Contents: read and write** on that repository
 
 Creating a release requires Contents write; listing releases and reading assets require Contents read. See [GitHub's release API](https://docs.github.com/en/rest/releases/releases) and [release asset API](https://docs.github.com/en/rest/releases/assets).
-
-## Run locally
 
 ```bash
 cp .env.example .env
