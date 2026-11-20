@@ -4,7 +4,6 @@ COPY package*.json ./
 RUN npm install
 COPY tsconfig.json ./
 COPY src ./src
-COPY test ./test
 RUN npm run build
 
 FROM node:26-alpine AS runtime
